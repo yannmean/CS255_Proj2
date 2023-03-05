@@ -47,8 +47,11 @@ class MessengerClient {
    * Return Type: certificate object/dictionary
    */
   async generateCertificate (username) {
-    throw ('not implemented!')
-    const certificate = {}
+    const {pub, sec} = generateEG();
+    this.EGKeyPair = {pub, sec};
+    const certificate = {
+      username, pub 
+    };
     return certificate
   }
 
@@ -64,8 +67,13 @@ class MessengerClient {
   async receiveCertificate (certificate, signature) {
   // The signature will be on the output of stringifying the certificate
   // rather than on the certificate directly.
-    const certString = JSON.stringify(certificate)
-    throw ('not implemented!')
+    const certString = JSON.stringify(certificate);
+    const {username, pub} = certificate;
+    if (verifyWithECDSA(this.caPublicKey, certString, signature)
+    ){
+      this.certs[username] = certificate
+    };
+    throw "Invalid Certificate";
   }
 
   /**
