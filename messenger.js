@@ -1,5 +1,5 @@
-'use strict'
 
+'use strict'
 /** ******* Imports ********/
 
 const {
@@ -24,22 +24,21 @@ const {
 
 /* Write out all the functions following the Signal protocol */
 
-function GENDERATE_DH(){
-  return generateEG()
-}
+//GENERATE_DH() = generateEG()
 
 function DH(dh_pair, dh_pub){
   return computeDH(dh_pair.sec, dh_pub)
 }
 
 function KDF_RK(rk, dh_out){
-  return HKDF(rk, genRandomSalt(), "ratchet-str")
+  return HKDF(rk, dh_out, "ratchet-str")
 }
 
-function KDF_CK(ck){
-  let ckNew = HMACtoHMACKey(ck, "chainKey");
-  let mk = HMACtoAESKey(ck, "messageKey");
-  return [ckNew, mk]
+async function KDF_CK(ck){
+  let ckNew = await HMACtoHMACKey(ck, "chainKey");
+  let mk = await HMACtoAESKey(ck, "messageKey");
+  let mkBuf = await HMACtoAESKey(ck, "messageKey", true);
+  return [ckNew, mk, mkBuf]
 }
 
 function ENCRYPT(mk, plaintext, iv, associated_data){
@@ -98,15 +97,13 @@ class MessengerClient {
    * Return Type: certificate object/dictionary
    */
   async generateCertificate (username) {
-    const {pub, sec} = GENDERATE_DH();
-    /*
-    store the ElGamal key pairs
-    */
-    this.EGKeyPair = {pub, sec};
+    this.EGKeyPair = await generateEG();
     const certificate = {
-      username, pub 
+      username: username,
+      publicKeyJSON: await cryptoKeyToJSON(this.EGKeyPair.pub),
+      publicKey: this.EGKeyPair.pub
     };
-    return certificate
+    return certificate;
   }
 
   /**
@@ -122,19 +119,12 @@ class MessengerClient {
   // The signature will be on the output of stringifying the certificate
   // rather than on the certificate directly.
     const certString = JSON.stringify(certificate);
-    const {username, pub} = certificate;
-    /* 
-    See if H(pk, message) is equal to the signature or not
-    Here pk is this.caPublicKey, message is certString
-    */ 
-    if (!(await verifyWithECDSA(this.caPublicKey, certString, signature))
-    ){
-      throw "Invalid Certificate";
-    };
-    /*
-      store others' certificates
-      */
-      this.certs[username] = certificate
+    const verification = await verifyWithECDSA(this.caPublicKey, certString, signature);
+    if (!verification && await cryptoKeyToJSON(certificate.publicKey) != certificate.publicKeyJSON) {
+      throw ("Certificate is not valid!");
+    }
+
+    this.certs[certificate.username] = certificate;
   }
 
   /**
@@ -147,59 +137,48 @@ class MessengerClient {
  * Return Type: Tuple of [dictionary, string]
  */
   async sendMessage (name, plaintext) {
-    
-    /*
-    obtain receiver's certificat,
-    from their cerficate, obtain their public key
-    */
-    const theirCertificate = this.certs[name]; 
-    const theirPublicKey = theirCertificate.pub;
-
-    //compute DH secret from sk and caPK 
-    const secret = DH(this.EGKeyPair, theirPublicKey);
-    
-    /* 
-    check if name is in this.conn, if not initialize
-    keep tracking root key (rk), chain key (ck)
-    */
-    if(!this.conns[name]){
-
-      const dhs = GENDERATE_DH();
-      let dhr = theirPublicKey;
-      let rk, cks = KDF_RK(secret, DH(dhs, dhr));
+    if (!(name in this.conns)) { 
+      const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
+      const dhs = await generateEG();
+      const dhsOutput = await computeDH(dhs.sec, this.certs[name].publicKey);
+      const [rk, cks] = await KDF_RK(initialRootKey, dhsOutput);
       this.conns[name] = {
-        dhs,
-        dhr,
-        rk,
-        cks, 
-        ckr: null,
-        ns: 0,
-        nr: 0,
-        pn: 0,
-        mkskipped: {}
+        DHs: dhs,
+        DHr: this.certs[name].publicKey,
+        RK: rk,
+        CKs: cks,
+        CKr: null,
+        Ns: 0,
+        Nr: 0,
+        PN: 0,
+        MKSKIPPED: {}, 
+        CK: dhs
       };
-    }; 
-    
-    const {ckNew, mk} = KDF_CK(this.conns[name].cks);
-    this.conns[name].cks = ckNew;
-    this.conns[name].ns++;
-  
-   
-    /*
-    create the header
-    */
+    }
+    const connection = this.conns[name];
+    const [CKs, mk, mkBuf] = await KDF_CK(connection.CKs);
+    connection.CKs = CKs;
+    connection.Ns += 1;
     const iv = genRandomSalt();
-    const header = HEADER(
-      this.conns[name].dhs, 
-      this.conns[name].pn, 
-      this.conns[name].n,
-      mk,
-      iv,
-      this.govPublicKey
-      )
 
+    const ivGov = genRandomSalt();
+    const dhGov = await generateEG();
+
+    const sharedGovKey = await computeDH(dhGov.sec, this.govPublicKey);
+    const aesKeyGov = await HMACtoAESKey(sharedGovKey, govEncryptionDataStr);
+    const cGov = await encryptWithGCM(aesKeyGov, mkBuf, ivGov)
+
+    const header = {
+      DHs: connection.DHs,
+      PN: connection.PN,
+      Ns: connection.Ns,
+      receiverIV: iv,
+      vGov: dhGov.pub,
+      cGov: cGov,
+      ivGov: ivGov,
+    }
     
-    const ciphertext = ENCRYPT(mk, plaintext, iv, JSON.stringify(header));
+    const ciphertext = await encryptWithGCM(mk, plaintext, iv, JSON.stringify(header));
     return [header, ciphertext]
   }
 
