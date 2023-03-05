@@ -32,6 +32,11 @@ class MessengerClient {
     // Feel free to modify their structure as you see fit.
     this.caPublicKey = certAuthorityPublicKey
     this.govPublicKey = govPublicKey
+
+    /*
+    perhaps for each active connection, for each name, we can save 
+    the DH secret, 
+    */
     this.conns = {} // data for each active connection
     this.certs = {} // certificates of other users
     this.EGKeyPair = {} // keypair from generateCertificate
@@ -48,6 +53,9 @@ class MessengerClient {
    */
   async generateCertificate (username) {
     const {pub, sec} = generateEG();
+    /*
+    store the ElGamal key pairs
+    */
     this.EGKeyPair = {pub, sec};
     const certificate = {
       username, pub 
@@ -69,11 +77,14 @@ class MessengerClient {
   // rather than on the certificate directly.
     const certString = JSON.stringify(certificate);
     const {username, pub} = certificate;
-    if (verifyWithECDSA(this.caPublicKey, certString, signature)
+    if (!verifyWithECDSA(this.caPublicKey, certString, signature)
     ){
-      this.certs[username] = certificate
+      throw "Invalid Certificate";
     };
-    throw "Invalid Certificate";
+    /*
+      store others' certificates
+      */
+      this.certs[username] = certificate
   }
 
   /**
@@ -86,9 +97,39 @@ class MessengerClient {
  * Return Type: Tuple of [dictionary, string]
  */
   async sendMessage (name, plaintext) {
-    throw ('not implemented!')
-    const header = {}
-    const ciphertext = ''
+    
+    /*
+    obtain all the information needed
+    */
+    const senderCertificate = this.certs[name];
+    const theirPublicKey = senderCertificate.pub;
+    const {myPublicKey, myPrivateKey} = this.EGKeyPair;
+
+    /*
+    compute DH secret from sk and caPK 
+    */
+    const secret = computeDH(myPrivateKey, theirPublicKey);
+
+    /* 
+    check if name is in this.conn, if not initialize
+    keep tracking root key (rk), chain key (ck)
+    */
+    if(!this.conns[name]){
+
+      const {myPublicKeyNew, myPrivateKeyNew} = generateEG();
+      const [rk, ck] = HKDF(secret, genRandomSalt(), "ratchet-str");
+      this.conns[name] = {
+        myPrivateKeyNew,
+        theirPublicKey,
+        rk, 
+        ck
+      };
+
+    };
+    
+    let iv = genRandomSalt();
+    const header = {myPublicKeyNew, iv}
+    const ciphertext = encryptWithGCM(ck, plaintext, iv)
     return [header, ciphertext]
   }
 
