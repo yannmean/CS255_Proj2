@@ -22,6 +22,52 @@ const {
 
 /** ******* Implementation ********/
 
+/* Write out all the functions following the Signal protocol */
+
+function GENDERATE_DH(){
+  return generateEG()
+}
+
+function DH(dh_pair, dh_pub){
+  return computeDH(dh_pair.sec, dh_pub)
+}
+
+function KDF_RK(rk, dh_out){
+  return HKDF(rk, genRandomSalt(), "ratchet-str")
+}
+
+function KDF_CK(ck){
+  let ckNew = HMACtoHMACKey(ck, "chainKey");
+  let mk = HMACtoAESKey(ck, "messageKey");
+  return [ckNew, mk]
+}
+
+function ENCRYPT(mk, plaintext, iv, associated_data){
+  return encryptWithGCM(mk, plaintext, iv, associated_data)
+}
+
+function DECRYPT(mk, ciphertext, iv, associated_data){
+  return decryptWithGCM(mk, ciphertext, iv, associated_data)
+}
+
+function HEADER(dh_pair, pn, n, mk, iv, govPublicKey){
+  const dhGov = generateEG();
+  const secret = DH(dhGov, govPublicKey);
+  const aesKeyGov = HMACtoAESKey(secret, govEncryptionDataStr);
+  const cGov = encryptWithGCM(aesKeyGov, mk, );
+  const ivGov = genRandomSalt()
+  return {
+    pub: dh_pair.pub,
+    previousChainLen: pn,
+    messageNumber: n,
+    vGov: dhGov.pub,
+    cGov: cGov,
+    ivGov: ivGov,
+    iv: iv
+  }
+}
+
+
 class MessengerClient {
   constructor (certAuthorityPublicKey, govPublicKey) {
     // the certificate authority DSA public key is used to
@@ -52,7 +98,7 @@ class MessengerClient {
    * Return Type: certificate object/dictionary
    */
   async generateCertificate (username) {
-    const {pub, sec} = generateEG();
+    const {pub, sec} = GENDERATE_DH();
     /*
     store the ElGamal key pairs
     */
@@ -77,7 +123,11 @@ class MessengerClient {
   // rather than on the certificate directly.
     const certString = JSON.stringify(certificate);
     const {username, pub} = certificate;
-    if (!verifyWithECDSA(this.caPublicKey, certString, signature)
+    /* 
+    See if H(pk, message) is equal to the signature or not
+    Here pk is this.caPublicKey, message is certString
+    */ 
+    if (!(await verifyWithECDSA(this.caPublicKey, certString, signature))
     ){
       throw "Invalid Certificate";
     };
@@ -99,37 +149,57 @@ class MessengerClient {
   async sendMessage (name, plaintext) {
     
     /*
-    obtain all the information needed
+    obtain receiver's certificat,
+    from their cerficate, obtain their public key
     */
-    const senderCertificate = this.certs[name];
-    const theirPublicKey = senderCertificate.pub;
-    const {myPublicKey, myPrivateKey} = this.EGKeyPair;
+    const theirCertificate = this.certs[name]; 
+    const theirPublicKey = theirCertificate.pub;
 
-    /*
-    compute DH secret from sk and caPK 
-    */
-    const secret = computeDH(myPrivateKey, theirPublicKey);
-
+    //compute DH secret from sk and caPK 
+    const secret = DH(this.EGKeyPair, theirPublicKey);
+    
     /* 
     check if name is in this.conn, if not initialize
     keep tracking root key (rk), chain key (ck)
     */
     if(!this.conns[name]){
 
-      const {myPublicKeyNew, myPrivateKeyNew} = generateEG();
-      const [rk, ck] = HKDF(secret, genRandomSalt(), "ratchet-str");
+      const dhs = GENDERATE_DH();
+      let dhr = theirPublicKey;
+      let rk, cks = KDF_RK(secret, DH(dhs, dhr));
       this.conns[name] = {
-        myPrivateKeyNew,
-        theirPublicKey,
-        rk, 
-        ck
+        dhs,
+        dhr,
+        rk,
+        cks, 
+        ckr: null,
+        ns: 0,
+        nr: 0,
+        pn: 0,
+        mkskipped: {}
       };
-
-    };
+    }; 
     
-    let iv = genRandomSalt();
-    const header = {myPublicKeyNew, iv}
-    const ciphertext = encryptWithGCM(ck, plaintext, iv)
+    const {ckNew, mk} = KDF_CK(this.conns[name].cks);
+    this.conns[name].cks = ckNew;
+    this.conns[name].ns++;
+  
+   
+    /*
+    create the header
+    */
+    const iv = genRandomSalt();
+    const header = HEADER(
+      this.conns[name].dhs, 
+      this.conns[name].pn, 
+      this.conns[name].n,
+      mk,
+      iv,
+      this.govPublicKey
+      )
+
+    
+    const ciphertext = ENCRYPT(mk, plaintext, iv, JSON.stringify(header));
     return [header, ciphertext]
   }
 
