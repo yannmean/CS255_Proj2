@@ -136,7 +136,6 @@ class MessengerClient {
 
       const [rk, cks] = await KDF_RK(initialRootKey, dhsOutput);
       connection.DHs = dhs;
-      connection.DHr = dhs.pub;
       connection.CKs = cks;
     }
     const [CKs, mk, mkBuf] = await KDF_CK(connection.CKs);
@@ -201,8 +200,8 @@ class MessengerClient {
     connection.Ns = 0;
     connection.Nr = 0;
     connection.DHr = header.DH;
-
-    const [rkr, ckr] = await KDF_RK(connection.RK, await computeDH(this.EGKeyPair.sec, connection.DHr));
+    connection.DHs = this.EGKeyPair.sec;
+    const [rkr, ckr] = await KDF_RK(connection.RK, await computeDH(connection.DHs, connection.DHr));
     connection.CKr = ckr;
     connection.DHs = await generateEG();
     const [rks, cks] = await KDF_RK(connection.RK, await computeDH(connection.DHs.sec, connection.DHr));
