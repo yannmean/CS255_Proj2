@@ -23,6 +23,7 @@ const {
 /** ******* Implementation ********/
 
 /* Write out all the functions following the Signal protocol */
+const MAX_SKIP = 40;
 
 async function KDF_RK(rk, dh_out){
   return await HKDF(rk, dh_out, "ratchet-str")
@@ -134,8 +135,8 @@ class MessengerClient {
       const dhsOutput = await computeDH(dhs.sec, this.certs[name].publicKey);
 
       const [rk, cks] = await KDF_RK(initialRootKey, dhsOutput);
-      connection.RK = rk;
       connection.DHs = dhs;
+      connection.DHr = dhs.pub;
       connection.CKs = cks;
     }
     const [CKs, mk, mkBuf] = await KDF_CK(connection.CKs);
@@ -151,9 +152,9 @@ class MessengerClient {
     const cGov = await encryptWithGCM(aesKeyGov, mkBuf, ivGov)
 
     const header = {
-      DHs: connection.DHs,
+      DH: connection.DHs.pub,
       PN: connection.PN,
-      Ns: connection.Ns,
+      N: connection.Ns,
       receiverIV: iv,
       vGov: dhGov.pub,
       cGov: cGov,
@@ -163,6 +164,50 @@ class MessengerClient {
 
     const ciphertext = await encryptWithGCM(mk, plaintext, iv, JSON.stringify(header));
     return [header, ciphertext]
+  }
+
+  async TrySkippedMessageKeys(name, connection, header, ciphertext) {
+    if ((header.DH, header.N) in connection.MKSKIPPED) {
+      const mk = connection.MKSKIPPED[(header.DH, header.N)];
+      delete connection.MKSKIPPED[(header.DH, header.N)];
+      try {
+        const plaintext = byteArrayToString(await decryptWithGCM(mk, ciphertext, header.receiverIV, JSON.stringify(header)));
+        this.conns[name] = {...connection};
+        return plaintext;
+      } catch (err) {
+        throw ("Message integrity comprimized");
+      }    
+    }
+    return null;
+  }
+  
+  async SkipMessageKeys(connection, until) {
+    if (connection.Nr + MAX_SKIP < until) {
+      throw ("too far; cannot process");
+    }
+    if (connection.CKr !== null) {
+      while (connection.Nr < until) {
+        const [ckr, mk] = await KDF_CK(connection.CKr);
+        connection.CKr = ckr;
+        connection.MKSKIPPED[(connection.DHr, connection.Nr)] = mk;
+        connection.Nr += 1;
+      }
+    }
+    return connection;
+  }
+  
+  async DHRatchet(connection, header) {
+    connection.PN = connection.Ns;                          
+    connection.Ns = 0;
+    connection.Nr = 0;
+    connection.DHr = header.DH;
+
+    const [rkr, ckr] = await KDF_RK(connection.RK, await computeDH(this.EGKeyPair.sec, connection.DHr));
+    connection.CKr = ckr;
+    connection.DHs = await generateEG();
+    const [rks, cks] = await KDF_RK(connection.RK, await computeDH(connection.DHs.sec, connection.DHr));
+    connection.CKs = cks;
+    return connection;
   }
 
   /**
@@ -177,15 +222,15 @@ class MessengerClient {
   async receiveMessage (name, [header, ciphertext]) {
     if (!(name in this.conns)) { 
       const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
-      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DHs.pub);
+      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DH);
       const [rk, ckr] = await KDF_RK(initialRootKey, dhOutputOne);
 
       this.conns[name] = {
-        DHs: this.EGKeyPair, //sending key
-        DHr: header.DHs.pub,           //receiving key
-        RK: initialRootKey,  //root key
-        CKs: null,           //chaining sending key
-        CKr: ckr,           //receiving sending key
+        DHs: this.EGKeyPair,
+        DHr: header.DH,
+        RK: initialRootKey,
+        CKs: null,
+        CKr: ckr,
         Ns: 0,
         Nr: 0,
         PN: 0,
@@ -193,37 +238,38 @@ class MessengerClient {
       };
 
     }
-    const connection = this.conns[name];
+    let connection = this.conns[name];
     if (connection.CKr === null) {
       const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
-      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DHs.pub);
+      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DH);
       const [rk, ckr] = await KDF_RK(initialRootKey, dhOutputOne);
-      connection.RK = rk;
       connection.CKr = ckr;
+      connection.DHr = header.DH;
     }
+
+    const plaintext = await this.TrySkippedMessageKeys(name, connection, header, ciphertext);
+    if (plaintext !== null) {
+      return plaintext;
+    }
+    if (header.DH !== connection.DHr) {
+      connection = await this.SkipMessageKeys(connection, header.PN);
+      connection = await this.DHRatchet(connection, header);
+    }
+    connection = await this.SkipMessageKeys(connection, header.N);
     const [CKr, mk, _] = await KDF_CK(connection.CKr);
     connection.CKr = CKr;
     connection.Nr += 1;
-    // const connection = this.conns[name];
-    // const newConnection = {...connection};
 
-    // newConnection.Nr += 1;
-
-    // newConnection.DHs = await generateEG();
-
-    // const dhOutputTwo = await computeDH(newConnection.DHs.sec, newConnection.DHr);
-    // const newSendingKeys = await KDF_RK(newConnection.RK, dhOutputTwo);
-    // newConnection.RK = newSendingKeys[0];
-    // newConnection.CKs = newSendingKeys[1];
-    // const [CKr, mk, _] = await KDF_CK(newConnection.CKr);
-    // newConnection.CKr = CKr;
     try {
       const plaintext = byteArrayToString(await decryptWithGCM(mk, ciphertext, header.receiverIV, JSON.stringify(header)));
+      this.conns[name] = {...connection};
       return plaintext;
     } catch (err) {
       throw ("Message integrity comprimized");
     }
   }
+
+
 };
 
 module.exports = {
