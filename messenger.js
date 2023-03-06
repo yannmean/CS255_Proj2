@@ -200,8 +200,8 @@ class MessengerClient {
     connection.Ns = 0;
     connection.Nr = 0;
     connection.DHr = header.DH;
-    connection.DHs = this.EGKeyPair.sec;
-    const [rkr, ckr] = await KDF_RK(connection.RK, await computeDH(connection.DHs, connection.DHr));
+    connection.DHs = this.EGKeyPair;
+    const [rkr, ckr] = await KDF_RK(connection.RK, await computeDH(connection.DHs.sec, connection.DHr));
     connection.CKr = ckr;
     connection.DHs = await generateEG();
     const [rks, cks] = await KDF_RK(connection.RK, await computeDH(connection.DHs.sec, connection.DHr));
