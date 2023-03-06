@@ -24,14 +24,8 @@ const {
 
 /* Write out all the functions following the Signal protocol */
 
-//GENERATE_DH() = generateEG()
-
-function DH(dh_pair, dh_pub){
-  return computeDH(dh_pair.sec, dh_pub)
-}
-
-function KDF_RK(rk, dh_out){
-  return HKDF(rk, dh_out, "ratchet-str")
+async function KDF_RK(rk, dh_out){
+  return await HKDF(rk, dh_out, "ratchet-str")
 }
 
 async function KDF_CK(ck){
@@ -40,32 +34,6 @@ async function KDF_CK(ck){
   let mkBuf = await HMACtoAESKey(ck, "messageKey", true);
   return [ckNew, mk, mkBuf]
 }
-
-function ENCRYPT(mk, plaintext, iv, associated_data){
-  return encryptWithGCM(mk, plaintext, iv, associated_data)
-}
-
-function DECRYPT(mk, ciphertext, iv, associated_data){
-  return decryptWithGCM(mk, ciphertext, iv, associated_data)
-}
-
-function HEADER(dh_pair, pn, n, mk, iv, govPublicKey){
-  const dhGov = generateEG();
-  const secret = DH(dhGov, govPublicKey);
-  const aesKeyGov = HMACtoAESKey(secret, govEncryptionDataStr);
-  const cGov = encryptWithGCM(aesKeyGov, mk, );
-  const ivGov = genRandomSalt()
-  return {
-    pub: dh_pair.pub,
-    previousChainLen: pn,
-    messageNumber: n,
-    vGov: dhGov.pub,
-    cGov: cGov,
-    ivGov: ivGov,
-    iv: iv
-  }
-}
-
 
 class MessengerClient {
   constructor (certAuthorityPublicKey, govPublicKey) {
@@ -139,9 +107,12 @@ class MessengerClient {
   async sendMessage (name, plaintext) {
     if (!(name in this.conns)) { 
       const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
+
       const dhs = await generateEG();
       const dhsOutput = await computeDH(dhs.sec, this.certs[name].publicKey);
+
       const [rk, cks] = await KDF_RK(initialRootKey, dhsOutput);
+
       this.conns[name] = {
         DHs: dhs,
         DHr: this.certs[name].publicKey,
@@ -152,13 +123,24 @@ class MessengerClient {
         Nr: 0,
         PN: 0,
         MKSKIPPED: {}, 
-        CK: dhs
       };
     }
+
     const connection = this.conns[name];
+    if (connection.CKs === null) {
+      const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
+
+      const dhs = await generateEG();
+      const dhsOutput = await computeDH(dhs.sec, this.certs[name].publicKey);
+
+      const [rk, cks] = await KDF_RK(initialRootKey, dhsOutput);
+      connection.RK = rk;
+      connection.DHs = dhs;
+      connection.CKs = cks;
+    }
     const [CKs, mk, mkBuf] = await KDF_CK(connection.CKs);
     connection.CKs = CKs;
-    connection.Ns += 1;
+
     const iv = genRandomSalt();
 
     const ivGov = genRandomSalt();
@@ -177,7 +159,8 @@ class MessengerClient {
       cGov: cGov,
       ivGov: ivGov,
     }
-    
+    connection.Ns += 1;
+
     const ciphertext = await encryptWithGCM(mk, plaintext, iv, JSON.stringify(header));
     return [header, ciphertext]
   }
@@ -192,8 +175,54 @@ class MessengerClient {
  * Return Type: string
  */
   async receiveMessage (name, [header, ciphertext]) {
-    throw ('not implemented!')
-    return plaintext
+    if (!(name in this.conns)) { 
+      const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
+      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DHs.pub);
+      const [rk, ckr] = await KDF_RK(initialRootKey, dhOutputOne);
+
+      this.conns[name] = {
+        DHs: this.EGKeyPair, //sending key
+        DHr: header.DHs.pub,           //receiving key
+        RK: initialRootKey,  //root key
+        CKs: null,           //chaining sending key
+        CKr: ckr,           //receiving sending key
+        Ns: 0,
+        Nr: 0,
+        PN: 0,
+        MKSKIPPED: {}, 
+      };
+
+    }
+    const connection = this.conns[name];
+    if (connection.CKr === null) {
+      const initialRootKey = await computeDH(this.EGKeyPair.sec, this.certs[name].publicKey);
+      const dhOutputOne = await computeDH(this.EGKeyPair.sec, header.DHs.pub);
+      const [rk, ckr] = await KDF_RK(initialRootKey, dhOutputOne);
+      connection.RK = rk;
+      connection.CKr = ckr;
+    }
+    const [CKr, mk, _] = await KDF_CK(connection.CKr);
+    connection.CKr = CKr;
+    connection.Nr += 1;
+    // const connection = this.conns[name];
+    // const newConnection = {...connection};
+
+    // newConnection.Nr += 1;
+
+    // newConnection.DHs = await generateEG();
+
+    // const dhOutputTwo = await computeDH(newConnection.DHs.sec, newConnection.DHr);
+    // const newSendingKeys = await KDF_RK(newConnection.RK, dhOutputTwo);
+    // newConnection.RK = newSendingKeys[0];
+    // newConnection.CKs = newSendingKeys[1];
+    // const [CKr, mk, _] = await KDF_CK(newConnection.CKr);
+    // newConnection.CKr = CKr;
+    try {
+      const plaintext = byteArrayToString(await decryptWithGCM(mk, ciphertext, header.receiverIV, JSON.stringify(header)));
+      return plaintext;
+    } catch (err) {
+      throw ("Message integrity comprimized");
+    }
   }
 };
 
